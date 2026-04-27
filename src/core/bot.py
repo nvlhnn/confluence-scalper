@@ -49,6 +49,7 @@ class Bot:
 
         # Position tracking
         self.open_positions: list[PositionState] = []
+        self.pending_entries: list[Trade] = []  # Unfilled limit entries
 
         # Timing
         self._last_heartbeat = 0.0
@@ -242,9 +243,12 @@ class Bot:
     # ── Tier 3: Position Monitor ──────────────────────────
 
     async def _tier3_position_monitor(self) -> None:
-        """Monitor open positions every 30 seconds."""
+        """Monitor pending entries and open positions every 30 seconds."""
         while self.is_running:
             try:
+                # Check pending entry fills first
+                await self._check_pending_entries()
+
                 if not self.open_positions:
                     await asyncio.sleep(5)
                     continue
@@ -345,22 +349,33 @@ class Bot:
         if pos.unrealized_rr >= trail_rr and pos.trailing_stop > 0:
             atr_val = signal.metadata.get("atr", 0)
             if atr_val > 0:
+                new_stop = None
                 if signal.direction == "LONG":
-                    new_stop = pos.current_price - atr_val
-                    if new_stop > pos.trailing_stop:
-                        pos.trailing_stop = new_stop
-                        logger.info(
-                            "  {} trailing SL → ${:.4f}",
-                            signal.symbol, new_stop,
-                        )
+                    candidate = pos.current_price - atr_val
+                    if candidate > pos.trailing_stop:
+                        new_stop = candidate
                 else:
-                    new_stop = pos.current_price + atr_val
-                    if new_stop < pos.trailing_stop:
-                        pos.trailing_stop = new_stop
-                        logger.info(
-                            "  {} trailing SL → ${:.4f}",
-                            signal.symbol, new_stop,
+                    candidate = pos.current_price + atr_val
+                    if candidate < pos.trailing_stop:
+                        new_stop = candidate
+
+                if new_stop is not None:
+                    try:
+                        if trade.stop_order_id:
+                            await self.client.cancel_order(signal.symbol, trade.stop_order_id)
+                        sl_side = "sell" if signal.direction == "LONG" else "buy"
+                        amount = self.client.format_amount(
+                            signal.symbol, trade.position_size / pos.current_price,
                         )
+                        new_id = await self.client.place_stop_loss(
+                            signal.symbol, sl_side, amount, new_stop,
+                        )
+                        trade.stop_order_id = new_id
+                        pos.trailing_stop = new_stop
+                        logger.info("  {} trailing SL → ${:.4f}", signal.symbol, new_stop)
+                        await self.notifier.stop_updated(signal.symbol, new_stop, "TRAILING")
+                    except Exception as e:
+                        logger.error("Failed to update trailing SL: {}", e)
 
         # ── Time-based exit ──
         time_cfg = exec_cfg.get("time_stop", {})
@@ -382,9 +397,19 @@ class Bot:
     # ── Trade Execution ────────────────────────────────────
 
     async def _execute_signal(self, signal: Signal) -> Trade | None:
-        """Execute a signal: set leverage, place entry + SL + TP orders."""
+        """Execute a signal: set leverage, place entry order only.
+
+        SL/TP are placed after entry fill confirmation (see _check_pending_entries).
+        """
         try:
             balance = await self.client.get_balance()
+
+            # Check combined pending + open against limits
+            max_pos = self.config.max_open_positions
+            if len(self.open_positions) + len(self.pending_entries) >= max_pos:
+                logger.warning("Position limit reached (open={}, pending={})",
+                               len(self.open_positions), len(self.pending_entries))
+                return None
 
             # Calculate position size
             sizing = self.risk_manager.calculate_position_size(
@@ -401,12 +426,9 @@ class Bot:
             await self.client.set_margin_type(signal.symbol, self.config.margin_type)
             await self.client.set_leverage(signal.symbol, sizing["leverage"])
 
-            # Calculate amount in base currency
-            amount_precision = self.client.get_amount_precision(signal.symbol)
-            price_precision = self.client.get_price_precision(signal.symbol)
-            amount = round(
-                sizing["position_size"] / signal.entry_price,
-                amount_precision,
+            # Use ccxt precision methods
+            amount = self.client.format_amount(
+                signal.symbol, sizing["position_size"] / signal.entry_price,
             )
             min_amount = self.client.get_min_amount(signal.symbol)
             if amount < min_amount:
@@ -416,54 +438,33 @@ class Bot:
                 )
                 return None
 
-            entry_price = round(signal.entry_price, price_precision)
-            sl_price = round(signal.stop_loss, price_precision)
-            tp_price = round(signal.take_profit, price_precision)
+            entry_price = self.client.format_price(signal.symbol, signal.entry_price)
 
-            # ── Place orders ──
+            # ── Place entry order only — SL/TP after fill ──
             entry_side = "buy" if signal.direction == "LONG" else "sell"
-            sl_side = "sell" if signal.direction == "LONG" else "buy"
 
-            # Entry order (limit)
             entry_id = await self.client.place_limit_order(
                 signal.symbol, entry_side, amount, entry_price,
             )
 
-            # Stop loss (server-side)
-            sl_id = await self.client.place_stop_loss(
-                signal.symbol, sl_side, amount, sl_price,
-            )
-
-            # Take profit (server-side)
-            tp_id = await self.client.place_take_profit(
-                signal.symbol, sl_side, amount, tp_price,
-            )
-
-            # Create trade
+            # Create trade as PENDING (no SL/TP yet)
             trade = Trade(
                 signal=signal,
                 entry_order_id=entry_id,
-                stop_order_id=sl_id,
-                tp_order_id=tp_id,
                 status="PENDING",
-                entry_fill_price=entry_price,
+                entry_fill_price=0.0,  # Set on fill
                 position_size=sizing["position_size"],
                 margin_used=sizing["margin_required"],
                 leverage=sizing["leverage"],
                 opened_at=int(time.time() * 1000),
             )
 
-            # Track
+            # Track as pending — NOT in open_positions or risk_manager yet
+            self.pending_entries.append(trade)
             self.db.save_trade(trade)
-            self.risk_manager.add_open_position(trade)
-
-            pos = PositionState(trade=trade)
-            self.open_positions.append(pos)
-
-            await self.notifier.position_opened(trade)
 
             logger.info(
-                "✅ {} {} — entry=${:.4f} size=${:.2f} lev={}x",
+                "📝 {} {} — entry limit ${:.4f} size=${:.2f} lev={}x (pending fill)",
                 signal.direction, signal.symbol,
                 entry_price, sizing["position_size"], sizing["leverage"],
             )
@@ -474,6 +475,78 @@ class Bot:
             logger.error("Execution failed for {}: {}", signal.symbol, e)
             await self.notifier.error_alert(f"Execution failed: {signal.symbol} — {e}")
             return None
+
+    async def _check_pending_entries(self) -> None:
+        """Check if pending entry orders have been filled, cancelled, or timed out."""
+        entry_timeout = self.config.execution_config.get("entry_timeout_seconds", 300)
+
+        for trade in list(self.pending_entries):
+            signal = trade.signal
+            if not signal:
+                self.pending_entries.remove(trade)
+                continue
+
+            try:
+                order = await self.client.get_order(signal.symbol, trade.entry_order_id)
+                status = order.get("status", "").lower()
+
+                if status == "closed":  # Filled
+                    fill_price = float(order.get("average", 0) or order.get("price", 0))
+                    trade.entry_fill_price = fill_price
+                    trade.status = "OPEN"
+
+                    # Now place SL/TP with reduceOnly
+                    sl_side = "sell" if signal.direction == "LONG" else "buy"
+                    amount = self.client.format_amount(
+                        signal.symbol, trade.position_size / fill_price,
+                    )
+                    sl_price = self.client.format_price(signal.symbol, signal.stop_loss)
+                    tp_price = self.client.format_price(signal.symbol, signal.take_profit)
+
+                    sl_id = await self.client.place_stop_loss(
+                        signal.symbol, sl_side, amount, sl_price,
+                    )
+                    tp_id = await self.client.place_take_profit(
+                        signal.symbol, sl_side, amount, tp_price,
+                    )
+                    trade.stop_order_id = sl_id
+                    trade.tp_order_id = tp_id
+
+                    # Promote to open position
+                    self.pending_entries.remove(trade)
+                    self.risk_manager.add_open_position(trade)
+                    self.open_positions.append(PositionState(trade=trade))
+                    self.db.save_trade(trade)
+
+                    await self.notifier.position_opened(trade)
+                    logger.info(
+                        "✅ {} {} filled @ ${:.4f} — SL/TP placed",
+                        signal.direction, signal.symbol, fill_price,
+                    )
+
+                elif status in ("canceled", "cancelled", "expired", "rejected"):
+                    self.pending_entries.remove(trade)
+                    trade.status = "CANCELLED"
+                    trade.close_reason = status.upper()
+                    self.db.save_trade(trade)
+                    logger.info("Entry {} for {} {}", status, signal.direction, signal.symbol)
+
+                else:
+                    # Check timeout
+                    age_s = (time.time() * 1000 - trade.opened_at) / 1000
+                    if age_s > entry_timeout:
+                        await self.client.cancel_order(signal.symbol, trade.entry_order_id)
+                        self.pending_entries.remove(trade)
+                        trade.status = "CANCELLED"
+                        trade.close_reason = "TIMEOUT"
+                        self.db.save_trade(trade)
+                        logger.info(
+                            "Entry timed out ({:.0f}s): {} {}",
+                            age_s, signal.direction, signal.symbol,
+                        )
+
+            except Exception as e:
+                logger.error("Error checking pending entry {}: {}", trade.entry_order_id, e)
 
     async def _close_position(self, pos: PositionState, reason: str) -> None:
         """Close a position at market."""
@@ -521,19 +594,77 @@ class Bot:
     # ── Recovery ───────────────────────────────────────────
 
     async def _recover_positions(self) -> None:
-        """Recover open positions after restart."""
+        """Recover open positions after restart — reconstruct full state."""
         try:
             positions = await self.client.get_positions()
-            if positions:
-                logger.info("Recovering {} open positions", len(positions))
-                for p in positions:
-                    logger.info(
-                        "  {} {} — size={} entry={}",
-                        p.get("side"), p.get("symbol"),
-                        p.get("contracts"), p.get("entryPrice"),
-                    )
-            else:
+            if not positions:
                 logger.info("No open positions to recover")
+                return
+
+            logger.info("Recovering {} open positions...", len(positions))
+
+            for p in positions:
+                symbol = p.get("symbol", "")
+                side = p.get("side", "")
+                contracts = float(p.get("contracts", 0))
+                entry_price = float(p.get("entryPrice", 0))
+                notional = abs(float(p.get("notional", 0)))
+                leverage = int(p.get("leverage", 20))
+
+                if contracts <= 0 or not symbol:
+                    continue
+
+                direction = "LONG" if side == "long" else "SHORT"
+
+                # Build minimal signal for recovered position
+                signal = Signal(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    confluence_score=0,
+                    quality="RECOVERED",
+                    regime="UNKNOWN",
+                    timestamp=int(time.time() * 1000),
+                )
+
+                trade = Trade(
+                    signal=signal,
+                    status="OPEN",
+                    entry_fill_price=entry_price,
+                    position_size=notional if notional > 0 else contracts * entry_price,
+                    leverage=leverage,
+                    opened_at=int(time.time() * 1000),
+                )
+
+                # Try to find existing SL/TP orders on exchange
+                try:
+                    open_orders = await self.client.get_open_orders(symbol)
+                    for order in open_orders:
+                        otype = order.get("type", "").lower()
+                        if "stop" in otype and "profit" not in otype:
+                            trade.stop_order_id = str(order.get("id", ""))
+                            signal.stop_loss = float(order.get("stopPrice", 0) or 0)
+                        elif "profit" in otype:
+                            trade.tp_order_id = str(order.get("id", ""))
+                            signal.take_profit = float(order.get("stopPrice", 0) or 0)
+                except Exception:
+                    logger.warning("Could not fetch open orders for {}", symbol)
+
+                pos = PositionState(trade=trade)
+                self.open_positions.append(pos)
+                self.risk_manager.add_open_position(trade)
+
+                logger.info(
+                    "  Recovered: {} {} — ${:.2f} @ ${:.4f} SL={} TP={}",
+                    direction, symbol, trade.position_size, entry_price,
+                    f"${signal.stop_loss:.4f}" if signal.stop_loss else "none",
+                    f"${signal.take_profit:.4f}" if signal.take_profit else "none",
+                )
+
+            logger.info("Recovery complete: {} positions restored", len(self.open_positions))
+
         except Exception as e:
             logger.warning("Position recovery failed: {}", e)
 

@@ -24,6 +24,7 @@ class BinanceClient:
         self._cfg = config
         self._exchange: ccxt.binanceusdm | None = None
         self._exchange_info: dict | None = None  # Cached
+        self._raw_to_unified: dict[str, str] = {}  # Raw symbol → unified symbol map
 
     # ── Connection ─────────────────────────────────────────
 
@@ -52,6 +53,23 @@ class BinanceClient:
         balance = await self.get_balance()
         mode = "TESTNET" if self._cfg.is_testnet else "LIVE"
         logger.info("Binance {} connected — balance: ${:.2f}", mode, balance)
+
+        # Build raw → unified symbol map for screener use
+        self._build_symbol_map()
+
+    def _build_symbol_map(self) -> None:
+        """Build mapping from raw Binance symbol (e.g. BTCUSDT) to ccxt unified (e.g. BTC/USDT:USDT)."""
+        if not self._exchange:
+            return
+        self._raw_to_unified = {}
+        for unified, market in self._exchange.markets.items():
+            raw_id = market.get("id", "")
+            if raw_id:
+                self._raw_to_unified[raw_id] = unified
+
+    def raw_to_unified(self, raw_symbol: str) -> str | None:
+        """Convert a raw Binance symbol to ccxt unified symbol."""
+        return self._raw_to_unified.get(raw_symbol)
 
     async def close(self) -> None:
         """Close exchange connection."""
@@ -136,6 +154,13 @@ class BinanceClient:
         positions = await self._exchange.fetch_positions()
         return [p for p in positions if float(p.get("contracts", 0)) > 0]
 
+    async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        """Get open orders, optionally filtered by symbol."""
+        assert self._exchange is not None
+        if symbol:
+            return await self._exchange.fetch_open_orders(symbol)
+        return await self._exchange.fetch_open_orders()
+
     # ── Trading ────────────────────────────────────────────
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
@@ -211,17 +236,17 @@ class BinanceClient:
         amount: float,
         stop_price: float,
     ) -> str:
-        """Place a server-side stop-loss order. Returns order ID."""
+        """Place a server-side stop-loss order with reduceOnly. Returns order ID."""
         assert self._exchange is not None
         order = await self._exchange.create_order(
             symbol=symbol,
             type="stop_market",
             side=side.lower(),
             amount=amount,
-            params={"stopPrice": stop_price, "closePosition": False},
+            params={"stopPrice": stop_price, "reduceOnly": True},
         )
         logger.info(
-            "Stop loss placed: {} {} {} @ {} — id={}",
+            "Stop loss placed: {} {} {} @ {} — id={} (reduceOnly)",
             side, amount, symbol, stop_price, order["id"],
         )
         return str(order["id"])
@@ -233,17 +258,17 @@ class BinanceClient:
         amount: float,
         price: float,
     ) -> str:
-        """Place a take-profit order. Returns order ID."""
+        """Place a take-profit order with reduceOnly. Returns order ID."""
         assert self._exchange is not None
         order = await self._exchange.create_order(
             symbol=symbol,
             type="take_profit_market",
             side=side.lower(),
             amount=amount,
-            params={"stopPrice": price, "closePosition": False},
+            params={"stopPrice": price, "reduceOnly": True},
         )
         logger.info(
-            "Take profit placed: {} {} {} @ {} — id={}",
+            "Take profit placed: {} {} {} @ {} — id={} (reduceOnly)",
             side, amount, symbol, price, order["id"],
         )
         return str(order["id"])
@@ -290,3 +315,13 @@ class BinanceClient:
         assert self._exchange is not None
         market = self._exchange.markets.get(symbol, {})
         return int(market.get("precision", {}).get("amount", 3))
+
+    def format_price(self, symbol: str, price: float) -> float:
+        """Format price using ccxt's built-in precision handling."""
+        assert self._exchange is not None
+        return float(self._exchange.price_to_precision(symbol, price))
+
+    def format_amount(self, symbol: str, amount: float) -> float:
+        """Format amount using ccxt's built-in precision handling."""
+        assert self._exchange is not None
+        return float(self._exchange.amount_to_precision(symbol, amount))

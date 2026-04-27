@@ -61,6 +61,15 @@ class CoinScanner:
         # ── Step 2: Fetch tickers (one batch call) ──
         tickers = await self._client.fetch_all_tickers()
 
+        # Build reverse map: raw symbol (e.g. BTCUSDT) → ticker data
+        # ccxt fetch_tickers() keys by unified symbol (e.g. BTC/USDT:USDT),
+        # but our symbol list uses raw Binance format from fapiPublicGetExchangeInfo.
+        ticker_by_raw: dict[str, dict] = {}
+        for _unified_sym, ticker_data in tickers.items():
+            raw_id = ticker_data.get("info", {}).get("symbol", "")
+            if raw_id:
+                ticker_by_raw[raw_id] = ticker_data
+
         # ── Step 3: Volume & spread filter ──
         min_volume = filters.get("min_24h_volume", 50_000_000)
         max_spread = filters.get("max_spread_pct", 0.05) / 100.0
@@ -68,7 +77,7 @@ class CoinScanner:
 
         volume_filtered: list[dict] = []
         for symbol in all_symbols:
-            ticker = tickers.get(symbol)
+            ticker = ticker_by_raw.get(symbol)
             if not ticker:
                 continue
 
