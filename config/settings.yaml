@@ -1,0 +1,218 @@
+# ──────────────────────────────────────────────────────────
+# STRATEGY PARAMETERS
+# ──────────────────────────────────────────────────────────
+strategy:
+  name: "MCS"
+
+  timeframes:
+    entry: "5m"
+    regime: "15m"
+    trend: "1h"
+
+  # Layer 1: Regime Detection
+  regime:
+    adx_period: 14
+    bb_period: 20
+    bb_std_dev: 2.0
+    bb_width_lookback: 100
+    thresholds:
+      trending_adx: 25
+      ranging_adx: 20
+      dead_adx: 15
+      squeeze_bb_percentile: 20
+      volatile_bb_percentile: 80
+      volatile_adx: 30
+
+  # Layer 2: Trend Direction
+  trend:
+    ema_slow_period: 200
+    ema_fast_period: 50
+
+  # Layer 3: RSI Divergence
+  divergence:
+    rsi_period: 7
+    oversold_threshold: 25
+    overbought_threshold: 75
+    swing_lookback: 14
+    min_swing_distance: 3
+
+  # Layer 4: Level Confluence
+  levels:
+    vwap_enabled: true
+    ema_50_5m_enabled: true
+    prev_session_levels: true
+    proximity_pct: 0.15
+
+  # Layer 5: Volume
+  volume:
+    sma_period: 20
+    spike_multiplier: 1.5
+    strong_spike_multiplier: 2.0
+
+  # Layer 5b: Candle Patterns
+  candles:
+    engulfing_enabled: true
+    hammer_enabled: true
+    shooting_star_enabled: true
+    body_to_wick_ratio: 2.0
+
+  # Signal Scoring
+  scoring:
+    min_score: 8
+    a_plus_threshold: 11
+    a_threshold: 9
+    b_threshold: 8
+    b_size_multiplier: 0.75
+
+# ──────────────────────────────────────────────────────────
+# COIN SCREENING (Dynamic Scanner)
+# ──────────────────────────────────────────────────────────
+screening:
+  mode: "dynamic"
+
+  dynamic:
+    scan_pool: "all"
+    rescreen_interval_hours: 4
+    max_active_coins: 30
+
+    filters:
+      min_24h_volume: 50000000
+      max_spread_pct: 0.05
+      min_atr_pct: 0.15
+      max_atr_pct: 5.0
+      min_price: 0.001
+      quote_currency: "USDT"
+      contract_type: "PERPETUAL"
+
+    ranking:
+      volatility_weight: 0.4
+      volume_weight: 0.4
+      spread_weight: 0.2
+
+  blacklist:
+    - "1000SHIBUSDT"
+    - "1000PEPEUSDT"
+    - "USDCUSDT"
+    - "FDUSDUSDT"
+
+  whitelist:
+    - "BTCUSDT"
+    - "ETHUSDT"
+
+# ──────────────────────────────────────────────────────────
+# ENTRY & EXIT
+# ──────────────────────────────────────────────────────────
+execution:
+  order_type: "limit"
+  limit_price_buffer_pct: 0.02
+  order_timeout_candles: 3
+
+  stop_loss:
+    method: "atr"
+    atr_multiplier: 1.5
+    atr_period: 14
+    max_stop_pct: 2.0
+    min_stop_pct: 0.2
+
+  take_profit:
+    rr_ratio: 2.0
+    min_rr_ratio: 1.5
+
+  trailing:
+    activate_at_rr: 1.5
+    breakeven_at_rr: 1.5
+    breakeven_buffer_pct: 0.05
+    trail_by_atr: true
+    trail_atr_multiplier: 1.0
+
+  time_stop:
+    enabled: true
+    max_bars: 15
+    min_move_pct: 0.3
+
+# ──────────────────────────────────────────────────────────
+# RISK MANAGEMENT
+# ──────────────────────────────────────────────────────────
+risk:
+  position:
+    risk_per_trade_pct: 2.0
+    max_margin_pct: 25.0
+    min_order_value: 5.0
+
+  leverage:
+    base: 20
+    min: 10
+    max: 25
+    dynamic: true
+
+  limits:
+    max_open_positions: 2
+    max_daily_trades: 5
+    max_same_direction: 2
+
+  circuit_breakers:
+    daily_loss:
+      enabled: true
+      max_loss_pct: 6.0
+      reset_time_utc: "00:00"
+
+    drawdown:
+      enabled: true
+      max_drawdown_pct: 20.0
+      auto_resume: false
+
+    consecutive_losses:
+      enabled: true
+      max_consecutive: 4
+      cooldown_minutes: 120
+
+  margin_type: "ISOLATED"
+
+  correlation:
+    enabled: true
+    groups:
+      btc: ["BTCUSDT"]
+      eth: ["ETHUSDT"]
+      alt_l1: ["SOLUSDT", "SUIUSDT"]
+      meme: ["DOGEUSDT", "PEPEUSDT"]
+
+# ──────────────────────────────────────────────────────────
+# NOTIFICATIONS
+# ──────────────────────────────────────────────────────────
+notifications:
+  telegram:
+    enabled: true
+    messages:
+      signal_detected: true
+      position_opened: true
+      position_closed: true
+      stop_moved: true
+      daily_summary: true
+      circuit_breaker: true
+      error_alert: true
+      heartbeat: true
+    heartbeat_interval_minutes: 60
+    daily_summary_time_utc: "23:59"
+
+# ──────────────────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  console: true
+  file:
+    enabled: true
+    path: "logs/"
+    rotation: "10 MB"
+    retention: "30 days"
+
+# ──────────────────────────────────────────────────────────
+# DATABASE
+# ──────────────────────────────────────────────────────────
+database:
+  path: "data/tdb.db"
+  backup:
+    enabled: true
+    interval_hours: 24
+    max_backups: 7
+    path: "data/backups/"

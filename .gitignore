@@ -1,0 +1,29 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+env/
+
+# Data
+data/*.db
+data/backups/
+data/historical/
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Backtest reports
+backtest/reports/
