@@ -73,7 +73,7 @@ screening:
   dynamic:
     scan_pool: "all"
     rescreen_interval_hours: 4
-    max_active_coins: 30
+    max_active_coins: 50
 
     filters:
       min_24h_volume: 50000000

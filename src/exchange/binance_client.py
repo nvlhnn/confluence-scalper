@@ -37,16 +37,26 @@ class BinanceClient:
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
+                # Futures testnet/demo keys cannot call Binance SAPI wallet
+                # endpoints; avoid CCXT's authenticated currency preload.
+                "fetchCurrencies": False,
             },
         }
-
-        if self._cfg.is_testnet:
-            opts["sandbox"] = True
 
         self._exchange = ccxt.binanceusdm(opts)
 
         if self._cfg.is_testnet:
-            self._exchange.set_sandbox_mode(True)
+            # CCXT deprecated Binance futures sandbox mode; route USDT-M futures
+            # endpoints directly to Binance Futures testnet instead.
+            self._exchange.urls["api"].update({
+                "fapiPublic": "https://testnet.binancefuture.com/fapi/v1",
+                "fapiPublicV2": "https://testnet.binancefuture.com/fapi/v2",
+                "fapiPublicV3": "https://testnet.binancefuture.com/fapi/v3",
+                "fapiPrivate": "https://testnet.binancefuture.com/fapi/v1",
+                "fapiPrivateV2": "https://testnet.binancefuture.com/fapi/v2",
+                "fapiPrivateV3": "https://testnet.binancefuture.com/fapi/v3",
+                "fapiData": "https://testnet.binancefuture.com/futures/data",
+            })
 
         # Test connectivity
         await self._exchange.load_markets()

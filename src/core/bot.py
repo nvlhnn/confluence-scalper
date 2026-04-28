@@ -184,6 +184,8 @@ class Bot:
 
                 # Process each coin
                 all_signals: list[Signal] = []
+                checked_count = 0
+                skipped_count = 0
                 for symbol in active_coins:
                     data = candle_data.get(symbol, {})
                     candles_5m = data.get("5m", [])
@@ -191,7 +193,10 @@ class Bot:
                     candles_1h = data.get("1h", [])
 
                     if not candles_5m or not candles_15m or not candles_1h:
+                        skipped_count += 1
                         continue
+
+                    checked_count += 1
 
                     # Calculate indicators
                     ind_set, rsi_hist, price_hist = self.indicator_engine.calculate(
@@ -211,7 +216,10 @@ class Bot:
                         )
 
                 if not all_signals:
-                    logger.debug("  No signals this cycle")
+                    logger.info(
+                        "Signal cycle complete — checked={} skipped={} signals=0",
+                        checked_count, skipped_count,
+                    )
                     continue
 
                 # Sort by score (best first)
@@ -220,21 +228,33 @@ class Bot:
                 )
 
                 # Validate and execute
+                taken_count = 0
+                rejected_count = 0
+                failed_count = 0
                 for signal in all_signals:
                     approved, reason = self.risk_manager.validate(signal)
 
                     if approved:
                         trade = await self._execute_signal(signal)
                         if trade:
+                            taken_count += 1
                             self.db.log_signal(signal, taken=True)
                         else:
+                            failed_count += 1
                             self.db.log_signal(signal, taken=False, reason="Execution failed")
                     else:
+                        rejected_count += 1
                         logger.debug(
                             "  {} {} rejected: {}",
                             signal.direction, signal.symbol, reason,
                         )
                         self.db.log_signal(signal, taken=False, reason=reason)
+
+                logger.info(
+                    "Signal cycle complete — checked={} skipped={} signals={} taken={} rejected={} failed={}",
+                    checked_count, skipped_count, len(all_signals),
+                    taken_count, rejected_count, failed_count,
+                )
 
             except Exception as e:
                 logger.error("Tier 2 error: {}", e)
@@ -604,14 +624,18 @@ class Bot:
             logger.info("Recovering {} open positions...", len(positions))
 
             for p in positions:
-                symbol = p.get("symbol", "")
-                side = p.get("side", "")
-                contracts = float(p.get("contracts", 0))
-                entry_price = float(p.get("entryPrice", 0))
-                notional = abs(float(p.get("notional", 0)))
-                leverage = int(p.get("leverage", 20))
+                try:
+                    symbol = p.get("symbol") or ""
+                    side = (p.get("side") or "").lower()
+                    contracts = abs(float(p.get("contracts") or 0))
+                    entry_price = float(p.get("entryPrice") or p.get("entry_price") or 0)
+                    notional = abs(float(p.get("notional") or 0))
+                    leverage = int(float(p.get("leverage") or self.config.base_leverage))
+                except (TypeError, ValueError) as e:
+                    logger.warning("Skipping malformed recovered position: {} ({})", p, e)
+                    continue
 
-                if contracts <= 0 or not symbol:
+                if contracts <= 0 or not symbol or entry_price <= 0:
                     continue
 
                 direction = "LONG" if side == "long" else "SHORT"
