@@ -57,9 +57,8 @@ class ConfluenceScorer:
             trend_bias, rsi_history, price_history, ind.rsi,
         )
 
-        # Early exit — no divergence
-        if div_score == 0:
-            return None
+        # Divergence is a strong bonus, not a hard gate.
+        # Signals without divergence can still pass if other layers are strong.
 
         # ── Layer 4: Level Confluence ──
         level_score, near_levels = self._score_levels(ind)
@@ -73,14 +72,12 @@ class ConfluenceScorer:
         # ── Total Score ──
         total = regime_score + trend_score + div_score + level_score + volume_score + candle_score
 
-        # Hard requirements
+        # Hard requirements — only the essentials gate signals
         scoring_cfg = self._cfg.scoring_config
-        min_score = scoring_cfg.get("min_score", 8)
+        min_score = scoring_cfg.get("min_score", 7)
 
         if trend_score < 2:
             return self._rejected(ind, total, "No trend alignment", regime_name)
-        if div_score < 2:
-            return self._rejected(ind, total, "Weak divergence", regime_name)
         if regime_score < 1:
             return self._rejected(ind, total, "Bad regime", regime_name)
         if level_score < 1:

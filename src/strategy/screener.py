@@ -31,14 +31,14 @@ class CoinScanner:
         """
         Full scan: fetch all pairs → filter → rank → select top N.
 
-        Returns list of selected symbol names.
+        Returns list of selected unified (CCXT) symbol names.
         """
         screening_cfg = self._cfg.screening_config
         dyn_cfg = screening_cfg.get("dynamic", {})
         filters = dyn_cfg.get("filters", {})
         ranking = dyn_cfg.get("ranking", {})
-        blacklist = set(screening_cfg.get("blacklist", []))
-        whitelist = set(screening_cfg.get("whitelist", []))
+        blacklist_raw = set(screening_cfg.get("blacklist", []))
+        whitelist_raw = set(screening_cfg.get("whitelist", []))
         max_coins = dyn_cfg.get("max_active_coins", 30)
 
         # ── Step 1: Fetch all available futures pairs ──
@@ -48,15 +48,25 @@ class CoinScanner:
         contract_type = filters.get("contract_type", "PERPETUAL")
         quote = filters.get("quote_currency", "USDT")
 
-        all_symbols = [
+        all_raw_symbols = [
             s["symbol"] for s in all_symbols_info
             if s.get("contractType") == contract_type
             and s.get("quoteAsset") == quote
             and s.get("status") == "TRADING"
-            and s["symbol"] not in blacklist
+            and s["symbol"] not in blacklist_raw
         ]
-        total_scanned = len(all_symbols)
+        total_scanned = len(all_raw_symbols)
         logger.info("Scanner: {} USDT-M perpetual pairs found", total_scanned)
+
+        # Convert blacklist/whitelist raw symbols → unified for downstream use
+        blacklist = set()
+        for raw in blacklist_raw:
+            uni = self._client.raw_to_unified(raw)
+            blacklist.add(uni if uni else raw)
+        whitelist = set()
+        for raw in whitelist_raw:
+            uni = self._client.raw_to_unified(raw)
+            whitelist.add(uni if uni else raw)
 
         # ── Step 2: Fetch tickers (one batch call) ──
         tickers = await self._client.fetch_all_tickers()
@@ -76,9 +86,14 @@ class CoinScanner:
         min_price = filters.get("min_price", 0.001)
 
         volume_filtered: list[dict] = []
-        for symbol in all_symbols:
-            ticker = ticker_by_raw.get(symbol)
+        for raw_symbol in all_raw_symbols:
+            ticker = ticker_by_raw.get(raw_symbol)
             if not ticker:
+                continue
+
+            # Convert raw → unified CCXT symbol for all downstream use
+            unified = self._client.raw_to_unified(raw_symbol)
+            if not unified:
                 continue
 
             quote_vol = float(ticker.get("quoteVolume", 0) or 0)
@@ -97,7 +112,8 @@ class CoinScanner:
                 continue
 
             volume_filtered.append({
-                "symbol": symbol,
+                "symbol": unified,        # Use unified CCXT symbol from here on
+                "raw_symbol": raw_symbol,  # Keep raw for reference
                 "volume_24h": quote_vol,
                 "spread_pct": spread_pct * 100,  # Store as %
                 "price": last_price,
@@ -116,7 +132,7 @@ class CoinScanner:
         for i in range(0, len(volume_filtered), batch_size):
             batch = volume_filtered[i:i + batch_size]
             tasks = [
-                self._fetch_atr_pct(coin["symbol"])
+                self._fetch_atr_pct(coin["symbol"])  # unified symbol
                 for coin in batch
             ]
             atr_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -128,7 +144,7 @@ class CoinScanner:
                     continue
 
                 scored.append(CoinScore(
-                    symbol=coin["symbol"],
+                    symbol=coin["symbol"],  # unified CCXT symbol
                     score=0.0,  # Calculated next
                     volume_24h=coin["volume_24h"],
                     atr_pct=atr_pct,

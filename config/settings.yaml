@@ -31,8 +31,8 @@ strategy:
   # Layer 3: RSI Divergence
   divergence:
     rsi_period: 7
-    oversold_threshold: 25
-    overbought_threshold: 75
+    oversold_threshold: 35
+    overbought_threshold: 65
     swing_lookback: 14
     min_swing_distance: 3
 
@@ -41,7 +41,7 @@ strategy:
     vwap_enabled: true
     ema_50_5m_enabled: true
     prev_session_levels: true
-    proximity_pct: 0.15
+    proximity_pct: 0.30
 
   # Layer 5: Volume
   volume:
@@ -58,10 +58,10 @@ strategy:
 
   # Signal Scoring
   scoring:
-    min_score: 8
+    min_score: 7
     a_plus_threshold: 11
     a_threshold: 9
-    b_threshold: 8
+    b_threshold: 7
     b_size_multiplier: 0.75
 
 # ──────────────────────────────────────────────────────────
