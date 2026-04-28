@@ -329,6 +329,14 @@ class Bot:
         if not signal:
             return
 
+        exchange_pos = await self._sync_position_with_exchange(pos)
+        if exchange_pos is None:
+            return
+
+        position_amount = abs(float(exchange_pos.get("contracts") or 0))
+        if position_amount <= 0:
+            return
+
         exec_cfg = self.config.execution_config
         trail_cfg = exec_cfg.get("trailing", {})
 
@@ -350,7 +358,7 @@ class Bot:
 
                 # Place new stop
                 sl_side = "sell" if signal.direction == "LONG" else "buy"
-                amount = trade.position_size / pos.current_price
+                amount = self.client.format_amount(signal.symbol, position_amount)
                 new_id = await self.client.place_stop_loss(
                     signal.symbol, sl_side, amount, new_stop,
                 )
@@ -384,9 +392,7 @@ class Bot:
                         if trade.stop_order_id:
                             await self.client.cancel_order(signal.symbol, trade.stop_order_id)
                         sl_side = "sell" if signal.direction == "LONG" else "buy"
-                        amount = self.client.format_amount(
-                            signal.symbol, trade.position_size / pos.current_price,
-                        )
+                        amount = self.client.format_amount(signal.symbol, position_amount)
                         new_id = await self.client.place_stop_loss(
                             signal.symbol, sl_side, amount, new_stop,
                         )
@@ -414,6 +420,90 @@ class Bot:
                     )
                     await self._close_position(pos, "TIME")
 
+    async def _sync_position_with_exchange(self, pos: PositionState) -> dict | None:
+        """Reconcile in-memory position with Binance before managing exits.
+
+        If SL/TP/manual action already closed the exchange position, mark the
+        local trade closed and cancel any leftover protective order. This avoids
+        sending a later time-exit order that can accidentally flip the position.
+        """
+        trade = pos.trade
+        signal = trade.signal
+        if not signal:
+            return None
+
+        try:
+            exchange_pos = await self.client.get_position(signal.symbol)
+        except Exception as e:
+            logger.error("Failed to fetch exchange position for {}: {}", signal.symbol, e)
+            return None
+
+        expected_side = "long" if signal.direction == "LONG" else "short"
+        actual_side = (exchange_pos or {}).get("side", "").lower()
+
+        if exchange_pos and actual_side == expected_side:
+            return exchange_pos
+
+        # No matching live position. Binance likely closed via SL/TP or manual.
+        exit_order = None
+        close_reason = "EXCHANGE"
+        for order_id, reason in (
+            (trade.stop_order_id, "SL"),
+            (trade.tp_order_id, "TP"),
+        ):
+            if not order_id:
+                continue
+            try:
+                order = await self.client.get_order(signal.symbol, order_id)
+                if order.get("status", "").lower() == "closed":
+                    exit_order = order
+                    close_reason = reason
+                    break
+            except Exception as e:
+                logger.warning("Could not inspect protective order {}: {}", order_id, e)
+
+        # Cancel any remaining protective orders after the exchange position is gone.
+        for order_id in (trade.stop_order_id, trade.tp_order_id):
+            if not order_id or (exit_order and str(exit_order.get("id")) == order_id):
+                continue
+            await self.client.cancel_order(signal.symbol, order_id)
+
+        exit_price = pos.current_price
+        if exit_order:
+            exit_price = float(
+                exit_order.get("average")
+                or exit_order.get("price")
+                or exit_order.get("stopPrice")
+                or exit_order.get("info", {}).get("avgPrice")
+                or exit_order.get("info", {}).get("stopPrice")
+                or exit_price
+            )
+
+        trade.status = "CLOSED"
+        trade.exit_fill_price = exit_price
+        if trade.entry_fill_price and trade.position_size:
+            if signal.direction == "LONG":
+                trade.pnl = (exit_price - trade.entry_fill_price) / trade.entry_fill_price * trade.position_size
+            else:
+                trade.pnl = (trade.entry_fill_price - exit_price) / trade.entry_fill_price * trade.position_size
+            trade.fees = trade.position_size * 0.0004 * 2
+            trade.net_pnl = trade.pnl - trade.fees
+        trade.closed_at = int(time.time() * 1000)
+        trade.close_reason = close_reason
+
+        self.db.save_trade(trade)
+        self.risk_manager.remove_open_position(trade.id)
+        self.risk_manager.record_trade_result(trade)
+        if pos in self.open_positions:
+            self.open_positions.remove(pos)
+
+        await self.notifier.position_closed(trade, close_reason)
+        logger.warning(
+            "Position reconciled from exchange: {} {} closed by {} @ ${:.6f} — local P&L ${:.2f}",
+            signal.direction, signal.symbol, close_reason, exit_price, trade.net_pnl,
+        )
+        return None
+
     # ── Trade Execution ────────────────────────────────────
 
     async def _execute_signal(self, signal: Signal) -> Trade | None:
@@ -422,6 +512,10 @@ class Bot:
         SL/TP are placed after entry fill confirmation (see _check_pending_entries).
         """
         try:
+            if await self._has_unmanaged_exchange_positions():
+                logger.warning("Skipping new entry: unmanaged exchange position exists")
+                return None
+
             balance = await self.client.get_balance()
 
             # Check combined pending + open against limits
@@ -495,6 +589,29 @@ class Bot:
             logger.error("Execution failed for {}: {}", signal.symbol, e)
             await self.notifier.error_alert(f"Execution failed: {signal.symbol} — {e}")
             return None
+
+    async def _has_unmanaged_exchange_positions(self) -> bool:
+        """Return True when Binance has positions this bot is not managing."""
+        managed_symbols = {
+            pos.trade.signal.symbol
+            for pos in self.open_positions
+            if pos.trade.signal is not None
+        }
+        try:
+            positions = await self.client.get_positions()
+        except Exception as e:
+            logger.error("Could not check exchange positions before entry: {}", e)
+            return True
+
+        unmanaged = [
+            p.get("symbol")
+            for p in positions
+            if p.get("symbol") not in managed_symbols
+        ]
+        if unmanaged:
+            logger.warning("Unmanaged exchange positions detected: {}", unmanaged)
+            return True
+        return False
 
     async def _check_pending_entries(self) -> None:
         """Check if pending entry orders have been filled, cancelled, or timed out."""
@@ -584,8 +701,20 @@ class Bot:
 
             # Market close
             close_side = "sell" if signal.direction == "LONG" else "buy"
-            amount = trade.position_size / pos.current_price
-            await self.client.place_market_order(signal.symbol, close_side, amount)
+            exchange_pos = await self.client.get_position(signal.symbol)
+            if not exchange_pos:
+                logger.warning("No exchange position left to close for {}", signal.symbol)
+                return
+            actual_side = (exchange_pos.get("side") or "").lower()
+            expected_side = "long" if signal.direction == "LONG" else "short"
+            if actual_side != expected_side:
+                logger.error(
+                    "Refusing to close {}: expected {} position, exchange has {}",
+                    signal.symbol, expected_side, actual_side,
+                )
+                return
+            amount = abs(float(exchange_pos.get("contracts") or 0))
+            await self.client.close_position_market(signal.symbol, close_side, amount)
 
             # Update trade
             trade.status = "CLOSED"
@@ -675,6 +804,13 @@ class Bot:
                             signal.take_profit = float(order.get("stopPrice", 0) or 0)
                 except Exception:
                     logger.warning("Could not fetch open orders for {}", symbol)
+
+                if not trade.stop_order_id and not trade.tp_order_id:
+                    logger.warning(
+                        "Skipping unmanaged exchange position: {} {} has no bot SL/TP orders",
+                        direction, symbol,
+                    )
+                    continue
 
                 pos = PositionState(trade=trade)
                 self.open_positions.append(pos)

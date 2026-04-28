@@ -164,6 +164,13 @@ class BinanceClient:
         positions = await self._exchange.fetch_positions()
         return [p for p in positions if float(p.get("contracts", 0)) > 0]
 
+    async def get_position(self, symbol: str) -> dict | None:
+        """Get the open position for a symbol, if any."""
+        for position in await self.get_positions():
+            if position.get("symbol") == symbol:
+                return position
+        return None
+
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         """Get open orders, optionally filtered by symbol."""
         assert self._exchange is not None
@@ -224,20 +231,33 @@ class BinanceClient:
         symbol: str,
         side: str,
         amount: float,
+        reduce_only: bool = False,
     ) -> str:
         """Place a market order. Returns order ID."""
         assert self._exchange is not None
+        params = {"reduceOnly": True} if reduce_only else {}
         order = await self._exchange.create_order(
             symbol=symbol,
             type="market",
             side=side.lower(),
             amount=amount,
+            params=params,
         )
         logger.info(
-            "Market order placed: {} {} {} — id={}",
-            side, amount, symbol, order["id"],
+            "Market order placed: {} {} {}{} — id={}",
+            side, amount, symbol, " (reduceOnly)" if reduce_only else "", order["id"],
         )
         return str(order["id"])
+
+    async def close_position_market(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+    ) -> str:
+        """Close an existing futures position with a reduce-only market order."""
+        amount = self.format_amount(symbol, amount)
+        return await self.place_market_order(symbol, side, amount, reduce_only=True)
 
     async def place_stop_loss(
         self,
