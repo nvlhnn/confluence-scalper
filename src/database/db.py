@@ -351,12 +351,19 @@ class Database:
             return cur.fetchone()["total"]
 
     def get_trade_count_today(self) -> int:
-        """Number of trades opened today."""
+        """Number of filled trades opened today.
+
+        Unfilled limit-order timeouts are stored as CANCELLED trades with an
+        entry price of 0. They should not consume the daily trade cap because
+        no market risk was actually taken.
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM trades "
-                "WHERE date(created_at) = ?",
+                "WHERE date(created_at) = ? "
+                "AND status != 'CANCELLED' "
+                "AND COALESCE(entry_price, 0) > 0",
                 (today,),
             )
             return cur.fetchone()["cnt"]
