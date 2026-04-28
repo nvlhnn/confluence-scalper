@@ -61,7 +61,7 @@ strategy:
     min_score: 5
     a_plus_threshold: 11
     a_threshold: 9
-    b_threshold: 7
+    b_threshold: 5
     b_size_multiplier: 0.75
 
 # ──────────────────────────────────────────────────────────
