@@ -626,105 +626,20 @@ class Bot:
             try:
                 order = await self.client.get_order(signal.symbol, trade.entry_order_id)
                 status = order.get("status", "").lower()
+                filled_amount = float(
+                    order.get("filled")
+                    or order.get("info", {}).get("executedQty")
+                    or 0
+                )
 
                 if status == "closed":  # Filled
-                    fill_price = float(order.get("average", 0) or order.get("price", 0))
-                    filled_amount = float(
-                        order.get("filled")
-                        or order.get("amount")
-                        or order.get("info", {}).get("executedQty")
-                        or 0
-                    )
-                    if fill_price <= 0 or filled_amount <= 0:
-                        raise RuntimeError(
-                            f"Invalid fill details for {signal.symbol}: price={fill_price}, amount={filled_amount}"
-                        )
-
-                    trade.entry_fill_price = fill_price
-                    trade.status = "OPEN"
-                    sl_side = "sell" if signal.direction == "LONG" else "buy"
-
-                    exchange_pos = await self.client.get_position(signal.symbol)
-                    expected_side = "long" if signal.direction == "LONG" else "short"
-                    if not exchange_pos or (exchange_pos.get("side") or "").lower() != expected_side:
-                        logger.critical(
-                            "Entry filled but no matching exchange position for {}. Emergency closing reduce-only.",
-                            signal.symbol,
-                        )
-                        try:
-                            await self.client.close_position_market(signal.symbol, sl_side, filled_amount)
-                        except Exception as close_error:
-                            logger.error("Emergency close failed for {}: {}", signal.symbol, close_error)
-                        self.pending_entries.remove(trade)
-                        trade.status = "CLOSED"
-                        trade.exit_fill_price = fill_price
-                        trade.closed_at = int(time.time() * 1000)
-                        trade.close_reason = "POSITION_VERIFY_FAILED"
-                        self.db.save_trade(trade)
-                        await self.notifier.error_alert(
-                            f"Entry filled but position verify failed for {signal.symbol}; emergency close attempted"
-                        )
-                        continue
-
-                    position_amount = abs(float(exchange_pos.get("contracts") or filled_amount))
-
-                    # Now place SL/TP with reduceOnly. If either protective order
-                    # fails, immediately close the live position reduce-only.
-                    amount = self.client.format_amount(signal.symbol, position_amount)
-                    sl_price = self.client.format_price(signal.symbol, signal.stop_loss)
-                    tp_price = self.client.format_price(signal.symbol, signal.take_profit)
-
-                    sl_id = ""
-                    tp_id = ""
-                    try:
-                        sl_id = await self.client.place_stop_loss(
-                            signal.symbol, sl_side, amount, sl_price,
-                        )
-                        tp_id = await self.client.place_take_profit(
-                            signal.symbol, sl_side, amount, tp_price,
-                        )
-                    except Exception as protective_error:
-                        logger.critical(
-                            "Protective order failure for {} after entry fill: {}. Emergency closing.",
-                            signal.symbol, protective_error,
-                        )
-                        if sl_id:
-                            await self.client.cancel_order(signal.symbol, sl_id)
-                        if tp_id:
-                            await self.client.cancel_order(signal.symbol, tp_id)
-
-                        latest_pos = await self.client.get_position(signal.symbol)
-                        if latest_pos and (latest_pos.get("side") or "").lower() == expected_side:
-                            close_amount = abs(float(latest_pos.get("contracts") or position_amount))
-                            await self.client.close_position_market(signal.symbol, sl_side, close_amount)
-
-                        self.pending_entries.remove(trade)
-                        trade.status = "CLOSED"
-                        trade.exit_fill_price = fill_price
-                        trade.closed_at = int(time.time() * 1000)
-                        trade.close_reason = "PROTECTIVE_ORDER_FAILED"
-                        self.db.save_trade(trade)
-                        await self.notifier.error_alert(
-                            f"Emergency closed {signal.symbol}: protective order failed — {protective_error}"
-                        )
-                        continue
-
-                    trade.stop_order_id = sl_id
-                    trade.tp_order_id = tp_id
-
-                    # Promote to open position
-                    self.pending_entries.remove(trade)
-                    self.risk_manager.add_open_position(trade)
-                    self.open_positions.append(PositionState(trade=trade))
-                    self.db.save_trade(trade)
-
-                    await self.notifier.position_opened(trade)
-                    logger.info(
-                        "✅ {} {} filled @ ${:.4f} — SL/TP placed",
-                        signal.direction, signal.symbol, fill_price,
-                    )
+                    await self._promote_filled_entry(trade, order, "FILLED")
 
                 elif status in ("canceled", "cancelled", "expired", "rejected"):
+                    if filled_amount > 0:
+                        await self._promote_filled_entry(trade, order, f"PARTIAL_{status.upper()}")
+                        continue
+
                     self.pending_entries.remove(trade)
                     trade.status = "CANCELLED"
                     trade.close_reason = status.upper()
@@ -736,6 +651,20 @@ class Bot:
                     age_s = (time.time() * 1000 - trade.opened_at) / 1000
                     if age_s > entry_timeout:
                         await self.client.cancel_order(signal.symbol, trade.entry_order_id)
+                        cancelled_order = await self.client.get_order(signal.symbol, trade.entry_order_id)
+                        cancelled_filled = float(
+                            cancelled_order.get("filled")
+                            or cancelled_order.get("info", {}).get("executedQty")
+                            or 0
+                        )
+                        if cancelled_filled > 0:
+                            logger.warning(
+                                "Entry timed out after partial fill ({:.0f}s): {} {} filled={}",
+                                age_s, signal.direction, signal.symbol, cancelled_filled,
+                            )
+                            await self._promote_filled_entry(trade, cancelled_order, "PARTIAL_TIMEOUT")
+                            continue
+
                         self.pending_entries.remove(trade)
                         trade.status = "CANCELLED"
                         trade.close_reason = "TIMEOUT"
@@ -747,6 +676,114 @@ class Bot:
 
             except Exception as e:
                 logger.error("Error checking pending entry {}: {}", trade.entry_order_id, e)
+
+    async def _promote_filled_entry(self, trade: Trade, order: dict, reason: str) -> None:
+        """Promote a filled/partially-filled entry to OPEN and place protection.
+
+        Binance can partially fill a limit entry and later leave it open until
+        timeout. Cancelling the remainder does not remove the already-filled
+        position, so any positive fill must become a managed protected trade.
+        """
+        signal = trade.signal
+        if not signal:
+            if trade in self.pending_entries:
+                self.pending_entries.remove(trade)
+            return
+
+        fill_price = float(order.get("average", 0) or order.get("price", 0))
+        filled_amount = float(
+            order.get("filled")
+            or order.get("amount")
+            or order.get("info", {}).get("executedQty")
+            or 0
+        )
+        if fill_price <= 0 or filled_amount <= 0:
+            raise RuntimeError(
+                f"Invalid fill details for {signal.symbol}: price={fill_price}, amount={filled_amount}"
+            )
+
+        trade.entry_fill_price = fill_price
+        trade.status = "OPEN"
+        sl_side = "sell" if signal.direction == "LONG" else "buy"
+        expected_side = "long" if signal.direction == "LONG" else "short"
+
+        exchange_pos = await self.client.get_position(signal.symbol)
+        if not exchange_pos or (exchange_pos.get("side") or "").lower() != expected_side:
+            logger.critical(
+                "Entry {} but no matching exchange position for {}. Emergency closing reduce-only.",
+                reason, signal.symbol,
+            )
+            try:
+                await self.client.close_position_market(signal.symbol, sl_side, filled_amount)
+            except Exception as close_error:
+                logger.error("Emergency close failed for {}: {}", signal.symbol, close_error)
+            if trade in self.pending_entries:
+                self.pending_entries.remove(trade)
+            trade.status = "CLOSED"
+            trade.exit_fill_price = fill_price
+            trade.closed_at = int(time.time() * 1000)
+            trade.close_reason = "POSITION_VERIFY_FAILED"
+            self.db.save_trade(trade)
+            await self.notifier.error_alert(
+                f"Entry {reason} but position verify failed for {signal.symbol}; emergency close attempted"
+            )
+            return
+
+        position_amount = abs(float(exchange_pos.get("contracts") or filled_amount))
+        amount = self.client.format_amount(signal.symbol, position_amount)
+        sl_price = self.client.format_price(signal.symbol, signal.stop_loss)
+        tp_price = self.client.format_price(signal.symbol, signal.take_profit)
+
+        sl_id = ""
+        tp_id = ""
+        try:
+            sl_id = await self.client.place_stop_loss(signal.symbol, sl_side, amount, sl_price)
+            tp_id = await self.client.place_take_profit(signal.symbol, sl_side, amount, tp_price)
+        except Exception as protective_error:
+            logger.critical(
+                "Protective order failure for {} after entry {}: {}. Emergency closing.",
+                signal.symbol, reason, protective_error,
+            )
+            if sl_id:
+                await self.client.cancel_order(signal.symbol, sl_id)
+            if tp_id:
+                await self.client.cancel_order(signal.symbol, tp_id)
+
+            latest_pos = await self.client.get_position(signal.symbol)
+            if latest_pos and (latest_pos.get("side") or "").lower() == expected_side:
+                close_amount = abs(float(latest_pos.get("contracts") or position_amount))
+                await self.client.close_position_market(signal.symbol, sl_side, close_amount)
+
+            if trade in self.pending_entries:
+                self.pending_entries.remove(trade)
+            trade.status = "CLOSED"
+            trade.exit_fill_price = fill_price
+            trade.closed_at = int(time.time() * 1000)
+            trade.close_reason = "PROTECTIVE_ORDER_FAILED"
+            self.db.save_trade(trade)
+            await self.notifier.error_alert(
+                f"Emergency closed {signal.symbol}: protective order failed — {protective_error}"
+            )
+            return
+
+        trade.stop_order_id = sl_id
+        trade.tp_order_id = tp_id
+
+        if trade in self.pending_entries:
+            self.pending_entries.remove(trade)
+        self.risk_manager.add_open_position(trade)
+        self.open_positions.append(PositionState(trade=trade))
+        self.db.save_trade(trade)
+
+        await self.notifier.position_opened(trade)
+        if reason.startswith("PARTIAL"):
+            await self.notifier.error_alert(
+                f"Partial entry managed: {signal.symbol} filled {position_amount}; cancelled remainder and placed SL/TP"
+            )
+        logger.info(
+            "✅ {} {} {} @ ${:.4f} amount={} — SL/TP placed",
+            signal.direction, signal.symbol, reason, fill_price, position_amount,
+        )
 
     async def _close_position(self, pos: PositionState, reason: str) -> None:
         """Close a position at market."""

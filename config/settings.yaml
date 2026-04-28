@@ -58,7 +58,7 @@ strategy:
 
   # Signal Scoring
   scoring:
-    min_score: 7
+    min_score: 6
     a_plus_threshold: 11
     a_threshold: 9
     b_threshold: 7
