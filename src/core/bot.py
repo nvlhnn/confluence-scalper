@@ -629,23 +629,86 @@ class Bot:
 
                 if status == "closed":  # Filled
                     fill_price = float(order.get("average", 0) or order.get("price", 0))
+                    filled_amount = float(
+                        order.get("filled")
+                        or order.get("amount")
+                        or order.get("info", {}).get("executedQty")
+                        or 0
+                    )
+                    if fill_price <= 0 or filled_amount <= 0:
+                        raise RuntimeError(
+                            f"Invalid fill details for {signal.symbol}: price={fill_price}, amount={filled_amount}"
+                        )
+
                     trade.entry_fill_price = fill_price
                     trade.status = "OPEN"
-
-                    # Now place SL/TP with reduceOnly
                     sl_side = "sell" if signal.direction == "LONG" else "buy"
-                    amount = self.client.format_amount(
-                        signal.symbol, trade.position_size / fill_price,
-                    )
+
+                    exchange_pos = await self.client.get_position(signal.symbol)
+                    expected_side = "long" if signal.direction == "LONG" else "short"
+                    if not exchange_pos or (exchange_pos.get("side") or "").lower() != expected_side:
+                        logger.critical(
+                            "Entry filled but no matching exchange position for {}. Emergency closing reduce-only.",
+                            signal.symbol,
+                        )
+                        try:
+                            await self.client.close_position_market(signal.symbol, sl_side, filled_amount)
+                        except Exception as close_error:
+                            logger.error("Emergency close failed for {}: {}", signal.symbol, close_error)
+                        self.pending_entries.remove(trade)
+                        trade.status = "CLOSED"
+                        trade.exit_fill_price = fill_price
+                        trade.closed_at = int(time.time() * 1000)
+                        trade.close_reason = "POSITION_VERIFY_FAILED"
+                        self.db.save_trade(trade)
+                        await self.notifier.error_alert(
+                            f"Entry filled but position verify failed for {signal.symbol}; emergency close attempted"
+                        )
+                        continue
+
+                    position_amount = abs(float(exchange_pos.get("contracts") or filled_amount))
+
+                    # Now place SL/TP with reduceOnly. If either protective order
+                    # fails, immediately close the live position reduce-only.
+                    amount = self.client.format_amount(signal.symbol, position_amount)
                     sl_price = self.client.format_price(signal.symbol, signal.stop_loss)
                     tp_price = self.client.format_price(signal.symbol, signal.take_profit)
 
-                    sl_id = await self.client.place_stop_loss(
-                        signal.symbol, sl_side, amount, sl_price,
-                    )
-                    tp_id = await self.client.place_take_profit(
-                        signal.symbol, sl_side, amount, tp_price,
-                    )
+                    sl_id = ""
+                    tp_id = ""
+                    try:
+                        sl_id = await self.client.place_stop_loss(
+                            signal.symbol, sl_side, amount, sl_price,
+                        )
+                        tp_id = await self.client.place_take_profit(
+                            signal.symbol, sl_side, amount, tp_price,
+                        )
+                    except Exception as protective_error:
+                        logger.critical(
+                            "Protective order failure for {} after entry fill: {}. Emergency closing.",
+                            signal.symbol, protective_error,
+                        )
+                        if sl_id:
+                            await self.client.cancel_order(signal.symbol, sl_id)
+                        if tp_id:
+                            await self.client.cancel_order(signal.symbol, tp_id)
+
+                        latest_pos = await self.client.get_position(signal.symbol)
+                        if latest_pos and (latest_pos.get("side") or "").lower() == expected_side:
+                            close_amount = abs(float(latest_pos.get("contracts") or position_amount))
+                            await self.client.close_position_market(signal.symbol, sl_side, close_amount)
+
+                        self.pending_entries.remove(trade)
+                        trade.status = "CLOSED"
+                        trade.exit_fill_price = fill_price
+                        trade.closed_at = int(time.time() * 1000)
+                        trade.close_reason = "PROTECTIVE_ORDER_FAILED"
+                        self.db.save_trade(trade)
+                        await self.notifier.error_alert(
+                            f"Emergency closed {signal.symbol}: protective order failed — {protective_error}"
+                        )
+                        continue
+
                     trade.stop_order_id = sl_id
                     trade.tp_order_id = tp_id
 
@@ -693,13 +756,9 @@ class Bot:
             return
 
         try:
-            # Cancel existing SL/TP
-            if trade.stop_order_id:
-                await self.client.cancel_order(signal.symbol, trade.stop_order_id)
-            if trade.tp_order_id:
-                await self.client.cancel_order(signal.symbol, trade.tp_order_id)
-
-            # Market close
+            # Verify and close the live position first. Protective orders are
+            # cancelled after the reduce-only market close, so a failed/manual
+            # close attempt does not leave the position naked.
             close_side = "sell" if signal.direction == "LONG" else "buy"
             exchange_pos = await self.client.get_position(signal.symbol)
             if not exchange_pos:
@@ -715,6 +774,12 @@ class Bot:
                 return
             amount = abs(float(exchange_pos.get("contracts") or 0))
             await self.client.close_position_market(signal.symbol, close_side, amount)
+
+            # Cancel leftover SL/TP after successful market close.
+            if trade.stop_order_id:
+                await self.client.cancel_order(signal.symbol, trade.stop_order_id)
+            if trade.tp_order_id:
+                await self.client.cancel_order(signal.symbol, trade.tp_order_id)
 
             # Update trade
             trade.status = "CLOSED"
