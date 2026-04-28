@@ -538,7 +538,27 @@ class Bot:
 
             # Set leverage and margin type
             await self.client.set_margin_type(signal.symbol, self.config.margin_type)
-            await self.client.set_leverage(signal.symbol, sizing["leverage"])
+            if not await self.client.set_leverage(signal.symbol, sizing["leverage"]):
+                logger.warning(
+                    "Skipping {}: could not set leverage to {}x",
+                    signal.symbol, sizing["leverage"],
+                )
+                return None
+
+            # Binance enforces symbol-specific notional caps per leverage tier.
+            # Cap before formatting amount so weak/large signals are downsized
+            # instead of failing with -2027 at order placement.
+            max_notional = await self.client.get_max_notional_for_leverage(
+                signal.symbol, sizing["leverage"],
+            )
+            if max_notional and sizing["position_size"] > max_notional * 0.95:
+                capped_size = max_notional * 0.95
+                sizing["position_size"] = round(capped_size, 2)
+                sizing["margin_required"] = round(capped_size / sizing["leverage"], 2)
+                logger.info(
+                    "Capped {} size to ${:.2f} for {}x leverage tier",
+                    signal.symbol, sizing["position_size"], sizing["leverage"],
+                )
 
             # Use ccxt precision methods
             amount = self.client.format_amount(

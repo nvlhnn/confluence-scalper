@@ -172,11 +172,66 @@ class BinanceClient:
         return None
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
-        """Get open orders, optionally filtered by symbol."""
+        """Get open regular + conditional algo orders.
+
+        Binance USDT-M STOP_MARKET / TAKE_PROFIT_MARKET orders are exposed by
+        the futures algo endpoints on this testnet. CCXT's normal
+        fetch_open_orders() can miss them, which breaks recovery and cleanup.
+        """
         assert self._exchange is not None
+        orders: list[dict] = []
+
         if symbol:
-            return await self._exchange.fetch_open_orders(symbol)
-        return await self._exchange.fetch_open_orders()
+            orders.extend(await self._exchange.fetch_open_orders(symbol))
+        else:
+            self._exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+            orders.extend(await self._exchange.fetch_open_orders())
+
+        try:
+            params = {}
+            if symbol:
+                params["symbol"] = self._exchange.market(symbol)["id"]
+            algo_orders = await self._exchange.fapiPrivateGetOpenAlgoOrders(params)
+            for order in algo_orders:
+                raw_symbol = order.get("symbol")
+                unified_symbol = (
+                    symbol
+                    if symbol
+                    else self._exchange.safe_symbol(raw_symbol, None, None, "swap")
+                )
+                orders.append({
+                    "id": str(order.get("algoId", "")),
+                    "symbol": unified_symbol,
+                    "type": str(order.get("orderType", "")).lower(),
+                    "side": str(order.get("side", "")).lower(),
+                    "amount": float(order.get("quantity") or 0),
+                    "price": float(order.get("price") or 0),
+                    "stopPrice": float(order.get("triggerPrice") or 0),
+                    "status": str(order.get("algoStatus", "")).lower(),
+                    "reduceOnly": bool(order.get("reduceOnly")),
+                    "info": order,
+                })
+        except Exception as e:
+            logger.debug("Could not fetch open algo orders for {}: {}", symbol or "all", e)
+
+        return orders
+
+    async def get_max_notional_for_leverage(self, symbol: str, leverage: int) -> float | None:
+        """Return Binance max notional allowed for a symbol at leverage."""
+        assert self._exchange is not None
+        try:
+            tiers_by_symbol = await self._exchange.fetch_leverage_tiers([symbol])
+            tiers = tiers_by_symbol.get(symbol, [])
+            eligible = [
+                float(t.get("maxNotional") or 0)
+                for t in tiers
+                if float(t.get("maxLeverage") or 0) >= leverage
+            ]
+            eligible = [value for value in eligible if value > 0]
+            return max(eligible) if eligible else None
+        except Exception as e:
+            logger.debug("Could not fetch leverage tiers for {}: {}", symbol, e)
+            return None
 
     # ── Trading ────────────────────────────────────────────
 
@@ -311,8 +366,13 @@ class BinanceClient:
             logger.info("Order cancelled: {} — {}", symbol, order_id)
             return True
         except Exception as e:
-            logger.error("Failed to cancel order {}: {}", order_id, e)
-            return False
+            try:
+                await self._exchange.fapiPrivateDeleteAlgoOrder({"algoId": order_id})
+                logger.info("Algo order cancelled: {} — {}", symbol, order_id)
+                return True
+            except Exception as algo_error:
+                logger.error("Failed to cancel order {}: {}; algo: {}", order_id, e, algo_error)
+                return False
 
     async def get_order(self, symbol: str, order_id: str) -> dict:
         """Get order details."""
