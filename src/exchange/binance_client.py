@@ -310,9 +310,13 @@ class BinanceClient:
         side: str,
         amount: float,
     ) -> str:
-        """Close an existing futures position with a reduce-only market order."""
-        amount = self.format_amount(symbol, amount)
-        return await self.place_market_order(symbol, side, amount, reduce_only=True)
+        """Close an existing futures position with reduce-only market order(s)."""
+        order_ids: list[str] = []
+        for chunk in self.split_market_amount(symbol, amount):
+            order_ids.append(await self.place_market_order(symbol, side, chunk, reduce_only=True))
+            # Avoid bursting several market orders into Binance at the same ms.
+            await asyncio.sleep(0.2)
+        return ",".join(order_ids)
 
     async def place_stop_loss(
         self,
@@ -321,20 +325,24 @@ class BinanceClient:
         amount: float,
         stop_price: float,
     ) -> str:
-        """Place a server-side stop-loss order with reduceOnly. Returns order ID."""
+        """Place server-side stop-loss order(s) with reduceOnly. Returns order ID(s)."""
         assert self._exchange is not None
-        order = await self._exchange.create_order(
-            symbol=symbol,
-            type="stop_market",
-            side=side.lower(),
-            amount=amount,
-            params={"stopPrice": stop_price, "reduceOnly": True},
-        )
-        logger.info(
-            "Stop loss placed: {} {} {} @ {} — id={} (reduceOnly)",
-            side, amount, symbol, stop_price, order["id"],
-        )
-        return str(order["id"])
+        order_ids: list[str] = []
+        for chunk in self.split_market_amount(symbol, amount):
+            order = await self._exchange.create_order(
+                symbol=symbol,
+                type="stop_market",
+                side=side.lower(),
+                amount=chunk,
+                params={"stopPrice": stop_price, "reduceOnly": True},
+            )
+            logger.info(
+                "Stop loss placed: {} {} {} @ {} — id={} (reduceOnly)",
+                side, chunk, symbol, stop_price, order["id"],
+            )
+            order_ids.append(str(order["id"]))
+            await asyncio.sleep(0.2)
+        return ",".join(order_ids)
 
     async def place_take_profit(
         self,
@@ -343,24 +351,31 @@ class BinanceClient:
         amount: float,
         price: float,
     ) -> str:
-        """Place a take-profit order with reduceOnly. Returns order ID."""
+        """Place take-profit order(s) with reduceOnly. Returns order ID(s)."""
         assert self._exchange is not None
-        order = await self._exchange.create_order(
-            symbol=symbol,
-            type="take_profit_market",
-            side=side.lower(),
-            amount=amount,
-            params={"stopPrice": price, "reduceOnly": True},
-        )
-        logger.info(
-            "Take profit placed: {} {} {} @ {} — id={} (reduceOnly)",
-            side, amount, symbol, price, order["id"],
-        )
-        return str(order["id"])
+        order_ids: list[str] = []
+        for chunk in self.split_market_amount(symbol, amount):
+            order = await self._exchange.create_order(
+                symbol=symbol,
+                type="take_profit_market",
+                side=side.lower(),
+                amount=chunk,
+                params={"stopPrice": price, "reduceOnly": True},
+            )
+            logger.info(
+                "Take profit placed: {} {} {} @ {} — id={} (reduceOnly)",
+                side, chunk, symbol, price, order["id"],
+            )
+            order_ids.append(str(order["id"]))
+            await asyncio.sleep(0.2)
+        return ",".join(order_ids)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel an open order."""
         assert self._exchange is not None
+        if "," in str(order_id):
+            results = [await self.cancel_order(symbol, oid.strip()) for oid in str(order_id).split(",") if oid.strip()]
+            return all(results)
         try:
             await self._exchange.cancel_order(order_id, symbol)
             logger.info("Order cancelled: {} — {}", symbol, order_id)
@@ -377,6 +392,14 @@ class BinanceClient:
     async def get_order(self, symbol: str, order_id: str) -> dict:
         """Get order details."""
         assert self._exchange is not None
+        if "," in str(order_id):
+            orders = []
+            for oid in str(order_id).split(","):
+                oid = oid.strip()
+                if oid:
+                    orders.append(await self.get_order(symbol, oid))
+            closed = [o for o in orders if o.get("status", "").lower() == "closed"]
+            return closed[0] if closed else orders[0]
         return await self._exchange.fetch_order(order_id, symbol)
 
     # ── Symbol Info ────────────────────────────────────────
@@ -393,6 +416,16 @@ class BinanceClient:
         market = self._exchange.markets.get(symbol, {})
         limits = market.get("limits", {}).get("amount", {})
         return float(limits.get("min", 0.001))
+
+    def get_max_amount(self, symbol: str, *, market_order: bool = False) -> float | None:
+        """Get maximum order quantity for a symbol, preferring market limits when needed."""
+        assert self._exchange is not None
+        market = self._exchange.markets.get(symbol, {})
+        limit_group = "market" if market_order else "amount"
+        value = market.get("limits", {}).get(limit_group, {}).get("max")
+        if value is None and market_order:
+            value = market.get("limits", {}).get("amount", {}).get("max")
+        return float(value) if value else None
 
     def get_price_precision(self, symbol: str) -> int:
         """Get price decimal precision for a symbol."""
@@ -415,3 +448,22 @@ class BinanceClient:
         """Format amount using ccxt's built-in precision handling."""
         assert self._exchange is not None
         return float(self._exchange.amount_to_precision(symbol, amount))
+
+    def split_market_amount(self, symbol: str, amount: float) -> list[float]:
+        """Split amount into market-order-safe chunks for closes and STOP_MARKET/TP_MARKET."""
+        max_amount = self.get_max_amount(symbol, market_order=True)
+        if not max_amount or amount <= max_amount:
+            return [self.format_amount(symbol, amount)]
+
+        # Leave a small buffer under Binance's exact cap to avoid precision edge cases.
+        chunk_size = self.format_amount(symbol, max_amount * 0.95)
+        chunks: list[float] = []
+        remaining = float(amount)
+        while remaining > 0:
+            chunk = min(remaining, chunk_size)
+            formatted = self.format_amount(symbol, chunk)
+            if formatted <= 0:
+                break
+            chunks.append(formatted)
+            remaining -= formatted
+        return chunks

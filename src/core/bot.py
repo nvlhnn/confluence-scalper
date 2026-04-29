@@ -560,6 +560,24 @@ class Bot:
                     signal.symbol, sizing["position_size"], sizing["leverage"],
                 )
 
+            # STOP_MARKET / TAKE_PROFIT_MARKET protection uses Binance's market
+            # quantity cap, which can be much lower than the regular limit-order
+            # cap on tiny-price contracts. Keep entries inside that cap when
+            # possible; the client also chunks protection/close orders as a
+            # fallback for recovered or already-filled oversized positions.
+            max_market_amount = self.client.get_max_amount(signal.symbol, market_order=True)
+            if max_market_amount:
+                max_protectable_size = max_market_amount * signal.entry_price * 0.95
+                if sizing["position_size"] > max_protectable_size:
+                    sizing["position_size"] = round(max_protectable_size, 2)
+                    sizing["margin_required"] = round(
+                        sizing["position_size"] / sizing["leverage"], 2,
+                    )
+                    logger.info(
+                        "Capped {} size to ${:.2f} for market/protection qty limit",
+                        signal.symbol, sizing["position_size"],
+                    )
+
             # Use ccxt precision methods
             amount = self.client.format_amount(
                 signal.symbol, sizing["position_size"] / signal.entry_price,
